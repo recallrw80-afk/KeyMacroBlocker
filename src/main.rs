@@ -33,6 +33,7 @@ const WM_NULL: u32 = 0x0000;
 const WM_RBUTTONUP: u32 = 0x0205;
 const WM_LBUTTONDBLCLK: u32 = 0x0203;
 const LLKHF_INJECTED: u32 = 0x10;
+const LLKHF_UP: u32 = 0x80;
 const ERROR_ALREADY_EXISTS: u32 = 183;
 
 const WM_TRAY: u32 = 0x8000 + 1;
@@ -261,8 +262,10 @@ static SUPPRESS_UNTIL: AtomicI64 = AtomicI64::new(0);
 static SUPPRESS_START: AtomicI64 = AtomicI64::new(0);
 static DEBUG_INJECTED: AtomicBool = AtomicBool::new(false);
 static PAUSED: AtomicBool = AtomicBool::new(false);
+static PENDING_SNIP: AtomicBool = AtomicBool::new(false);
+static TRACE_VK: AtomicI64 = AtomicI64::new(-1);
 static PATTERNS: OnceLock<Vec<String>> = OnceLock::new();
-static BLOCKED_VKS: OnceLock<Vec<u32>> = OnceLock::new();
+static BLOCKED_VKS: OnceLock<Vec<(u32, bool)>> = OnceLock::new(); // (虚拟键码, 是否顺带截图)
 static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 static EXE_PATH: OnceLock<String> = OnceLock::new();
 
@@ -378,16 +381,32 @@ fn is_blocked_text(text: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn is_blocked_vk(vk: u32) -> bool {
-    BLOCKED_VKS
-        .get()
-        .map(|vs| vs.contains(&vk))
-        .unwrap_or(false)
+// 返回 Some(是否截图) 表示这个键要吞掉
+fn blocked_vk_action(vk: u32) -> Option<bool> {
+    BLOCKED_VKS.get().and_then(|vs| {
+        vs.iter()
+            .find(|(code, _)| *code == vk)
+            .map(|(_, snip)| *snip)
+    })
+}
+
+// 触发系统截图（等同 Win+Shift+S）
+fn fire_snip() {
+    unsafe {
+        let op = wide("open");
+        let uri = wide("ms-screenclip:");
+        ShellExecuteW(0, op.as_ptr(), uri.as_ptr(), std::ptr::null(), std::ptr::null(), 1);
+    }
+    log_stamped("snip triggered");
 }
 
 fn watchdog() {
     loop {
         thread::sleep(Duration::from_millis(10));
+
+        if PENDING_SNIP.swap(false, Ordering::Relaxed) {
+            fire_snip();
+        }
 
         if PAUSED.load(Ordering::Relaxed) {
             continue;
@@ -438,8 +457,23 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: Wparam, lparam: Lparam) -
         return CallNextHookEx(0, code, wparam, lparam);
     }
 
-    if is_blocked_vk(k.vk_code) {
-        log_stamped(&format!("blocked vk 0x{:02X}", k.vk_code));
+    if TRACE_VK.load(Ordering::Relaxed) == k.vk_code as i64 {
+        log_stamped(&format!(
+            "trace pass vk=0x{:02X} scan=0x{:02X}",
+            k.vk_code, k.scan_code
+        ));
+    }
+
+    if let Some(snip) = blocked_vk_action(k.vk_code) {
+        if snip && (k.flags & LLKHF_UP) == 0 {
+            PENDING_SNIP.store(true, Ordering::Relaxed);
+        }
+        log_stamped(&format!(
+            "blocked vk=0x{:02X} scan=0x{:02X}{}",
+            k.vk_code,
+            k.scan_code,
+            if snip { " (snip)" } else { "" }
+        ));
         return 1;
     }
 
@@ -721,7 +755,7 @@ fn remove_tray(hwnd: Hwnd) {
 
 fn load_patterns() {
     let mut subs: Vec<String> = Vec::new();
-    let mut vks: Vec<u32> = Vec::new();
+    let mut vks: Vec<(u32, bool)> = Vec::new();
 
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
@@ -734,9 +768,13 @@ fn load_patterns() {
                     }
                     let lower = line.to_lowercase();
                     if let Some(rest) = lower.strip_prefix("vk=") {
-                        let hex = rest.trim().trim_start_matches("0x");
+                        // 形如 vk=0x2C 或 vk=0x2C:snip
+                        let mut parts = rest.splitn(2, ':');
+                        let key = parts.next().unwrap_or("").trim();
+                        let action = parts.next().unwrap_or("").trim();
+                        let hex = key.trim_start_matches("0x");
                         if let Ok(v) = u32::from_str_radix(hex, 16) {
-                            vks.push(v);
+                            vks.push((v, action == "snip"));
                         }
                         continue;
                     }
@@ -773,6 +811,13 @@ fn main() {
         EXE_PATH.set(exe.to_string_lossy().to_string()).ok();
     }
 
+    if let Ok(v) = std::env::var("KMB_TRACE_VK") {
+        let hex = v.trim().trim_start_matches("0x").trim_start_matches("0X");
+        if let Ok(n) = i64::from_str_radix(hex, 16) {
+            TRACE_VK.store(n, Ordering::Relaxed);
+        }
+    }
+
     DEBUG_INJECTED.store(
         std::env::var("KMB_DEBUG_INJECTED").map(|v| v == "1").unwrap_or(false),
         Ordering::Relaxed,
@@ -785,7 +830,13 @@ fn main() {
         .get()
         .map(|v| {
             v.iter()
-                .map(|x| format!("0x{:02X}", x))
+                .map(|(x, snip)| {
+                    if *snip {
+                        format!("0x{:02X}:snip", x)
+                    } else {
+                        format!("0x{:02X}", x)
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(",")
         })

@@ -1,0 +1,90 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 1.100（msvc 工具链）
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.100.0
+
+      - name: 缓存 cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: rust-1.100
+
+      - name: 编译
+        run: cargo build --release --locked
+
+      - name: 校验 exe 图标已嵌入
+        shell: pwsh
+        run: |
+          $m = Get-ChildItem target\release\build -Recurse -Filter icon-embedded.ok -ErrorAction SilentlyContinue
+          if (-not $m) { throw "exe 图标没编进去：找不到 rc.exe，或 rc 执行失败" }
+          Write-Host "icon resource ok: $($m[0].FullName)"
+
+      - name: 打包
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force bin | Out-Null
+          Copy-Item target/release/KeyMacroBlocker.exe bin/
+          Copy-Item patterns.txt bin/
+          Copy-Item README.md bin/
+          Copy-Item LICENSE bin/
+          Get-ChildItem bin | Select-Object Name, Length | Format-Table -AutoSize
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: KeyMacroBlocker-windows-x64
+          path: bin/*
+          if-no-files-found: error
+
+      - name: 计算版本号
+        id: ver
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        run: |
+          $m = Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+          $ver = $m.Matches[0].Groups[1].Value
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $tag = $env:GITHUB_REF_NAME
+          } else {
+            $tag = "v$ver.$env:GITHUB_RUN_NUMBER"
+          }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          Write-Host "版本: $tag"
+
+      - name: 构建即发布正式版本
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ steps.ver.outputs.tag }}"
+          $zip = "KeyMacroBlocker-$tag-windows-x64.zip"
+          Compress-Archive -Path bin\* -DestinationPath $zip -Force
+          gh release view $tag --json tagName | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $zip --clobber
+          } else {
+            gh release create $tag $zip --title "KeyMacroBlocker $tag" --generate-notes --latest
+          }

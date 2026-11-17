@@ -7,7 +7,7 @@ https://oneclick.lenovo.com.cn/ 逐字敲进「运行」框再回车，打开厂
 > **作者特别讨厌这把键盘。** 写这个东西没有别的原因，就是每次误触都得手动关掉运行框和浏览器，烦到极点。
 
 唯一能拦的地方是按键流：每 10 ms 看一眼「运行」框，里面有那个网址就关掉它。
-顺带支持按虚拟键码直接吞按键（默认吞掉 `PrintScreen`，也就是那颗"截图"键）。
+顺带支持按虚拟键码直接吞按键（默认规则里**不吞**任何键，屏幕截图保持正常）。
 
 Rust 实现，纯 `std` + 直接 bind `user32`，**零第三方 crate**，单文件 exe，离线可编。
 常驻托盘，自带开机自启。
@@ -45,7 +45,7 @@ Rust 实现，纯 `std` + 直接 bind `user32`，**零第三方 crate**，单文
 
 - **正常 `Win+R` 完全不受影响**，没有延迟、没有吞键。
 - 按那个宏键：运行框闪一下（约 0.9 秒）然后自己消失，不开浏览器。
-- 按那个"截图"键（直接发 `PrintScreen`）：什么都不发生。
+- `PrintScreen` **不接管**，直接交给系统和你自己装的截图工具（Snipaste / PixPin / ShareX 之类）。
 - 其他任何 Run 输入（`notepad`、`cmd`……）照常执行。
 
 > 运行框没法阻止它弹出——除非把 `Win+R` 整个废掉，那样你自己的 Win+R 也就没了。
@@ -73,17 +73,45 @@ Rust 实现，纯 `std` + 直接 bind `user32`，**零第三方 crate**，单文
 
 ## 构建
 
-需要 Rust（`rustup`）。msvc 和 gnu 两种工具链都行；gnu 工具链自带链接器，
-不用装 Visual Studio：
+需要 Rust **1.100**，版本锁在 `rust-toolchain.toml` 里，`cargo` 会自动切过去。
+msvc 和 gnu 两种工具链都行；gnu 工具链自带链接器，不用装 Visual Studio。
 
 ```powershell
-rustup default stable-x86_64-pc-windows-gnu
-cargo build --release
+cargo build --release          # 产物 target\release\KeyMacroBlocker.exe
+.\build.ps1                    # 同上，并拷到 bin\
 ```
 
-或者直接跑 `.uild.ps1`，它会把产物拷到 `bin`。
+产物约 330 KB，静态链接 CRT，无运行库依赖。
 
-产物 `targeteleaseKeyMacroBlocker.exe`，约 320 KB，静态链接 CRT，无运行库依赖。
+### 图标
+
+两套图标，来源是同一个 `icon.ico`（自制，MIT，9 个尺寸）：
+
+| 位置 | 怎么进去的 |
+|---|---|
+| 托盘 / 窗口 | `include_bytes!` 打进 exe，运行时按 `SM_CXSMICON` 挑尺寸转 `HICON` |
+| exe 文件图标 | `build.rs` 把 `app.rc` 编译成 Win32 资源再链接进 exe |
+
+文件图标这一步需要资源编译器：
+
+- **msvc 工具链**：用 Windows SDK 里的 `rc.exe`，GitHub Actions 的 `windows-latest` 自带
+- **gnu 工具链**：用 `windres`（MinGW 自带，rustup 的 gnu 工具链不带）
+
+找不到时 `build.rs` 只打印 warning、不会让编译失败——此时的 exe 只是没有文件图标，托盘图标不受影响。
+
+### 自动发布
+
+仓库自带的 GitHub Actions（`.github/workflows/build.yml`）每次构建成功都会直接发一个
+**正式 Release**，不是 prerelease：
+
+| 触发 | 版本号 |
+|---|---|
+| push 到 `main` | `v0.1.0.<run_number>`（自动递增） |
+| 推 `v*` tag | 用 tag 名本身 |
+| Pull Request | 只编译，不发版 |
+
+Release 里挂 `KeyMacroBlocker-<tag>-windows-x64.zip`（exe + patterns.txt + README + LICENSE），
+并标记为 latest。
 
 ## 安装
 
@@ -101,18 +129,22 @@ cargo build --release
 oneclick
 lenovo
 
-# 直接吞掉的按键：十六进制虚拟键码
-# 0x2C = PrintScreen
-vk=0x2C
+# 直接接管 / 吞掉的按键（默认留空，不接管任何键）
+#   vk=0x2C         吞掉，什么也不做
+#   vk=0x2C:snip    吞掉并触发系统截图（等同 Win+Shift+S）
+# vk=0x2C
 ```
 
 - 不带前缀的行 = 运行框内容的匹配串。
-- `vk=` 开头的行 = 要吞掉的虚拟键码（`0x` 前缀可写可不写）。
+- `vk=` 开头的行 = 要接管/吞掉的虚拟键码（`0x` 前缀可写可不写）。
+- 加 `:snip` = 吞掉这一下，并让程序自己去调系统截图。
 - `#` 开头是注释。
 - 文件不存在时用内置的 `oneclick` / `lenovo`，不吞任何按键。
 
-**注意**：`vk=0x2C` 会把**整个 PrintScreen 键**吃掉，包括键盘上正常的 PrintScreen——
-宏键和普通 PrintScreen 发的是同一个键码，分不出来。不想失去截图就删掉那一行，改用 `Win+Shift+S`。
+**注意**：`vk=` 规则作用于**整个虚拟键码**，分不出是哪颗物理键。
+一旦接管 `0x2C`，键盘上所有发 PrintScreen 的键都会被吃掉，
+**包括你给第三方截图工具注册的那颗**——Snipaste、PixPin、ShareX 这类工具靠的就是同一个键码，
+你这边先吞了，它们就永远收不到。所以默认不接管任何键。
 
 换键盘型号、换推广域名，改这个文件就行。
 
