@@ -1,0 +1,17 @@
+[package]
+name = "keymacroblocker"
+version = "0.1.0"
+edition = "2021"
+description = "拦截键盘固件宏键弹出的运行框，并可吞掉指定虚拟键"
+license = "MIT"
+
+[[bin]]
+name = "KeyMacroBlocker"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
